@@ -2,7 +2,7 @@
 changed) or for a different quality preset (every archive).
 
 The mod folder's mod.json says which upscale projects feed it:
-    "build": {"projects": ["C:/path/to/work/shared", ...], "preset": "full"}
+    "build": {"projects": ["C:/path/to/work/shared", ...], "preset": "balanced"}
 Each project's project.json says how it was extracted. Progress is printed as
 "STEP n/N text" and "PROGRESS done/total" lines so a front end can show it.
 """
@@ -53,17 +53,18 @@ def stale_wads(mod_dir: Path, game_data: Path = GAME_DATA) -> list[str]:
 
 
 def build_mod(mod_dir: Path, preset: str | None = None, everything: bool = False, tools: str | None = None,
-              game_data: Path = GAME_DATA, log=print) -> list[Path]:
+              game_data: Path = GAME_DATA, log=print, backend: str = "torch", power: dict | None = None,
+              torch_model: Path | None = None) -> list[Path]:
     """Re-extract, re-upscale (only what changed) and repack. Returns the archives written."""
     meta = read_meta(mod_dir)
     cfg = meta.get("build") or {}
     projects = [Project(p) for p in cfg.get("projects", [])]
     if not projects:
         raise ValueError(f"{mod_dir.name} has no build recipe in mod.json (\"build\": {{\"projects\": [...]}})")
-    preset = preset or cfg.get("preset", "full")
+    preset = preset or cfg.get("preset", "balanced")
     if preset not in PRESETS:
         raise ValueError(f"unknown preset {preset!r}; choose {', '.join(PRESETS)}")
-    changed_preset = preset != cfg.get("preset", "full")
+    changed_preset = preset != cfg.get("preset", "balanced")
     targets = None if (everything or changed_preset) else set(stale_wads(mod_dir, game_data))
     if targets is not None and not targets:
         log("STEP 1/1 Nothing to rebuild: every archive matches the installed game")
@@ -90,7 +91,7 @@ def build_mod(mod_dir: Path, preset: str | None = None, everything: bool = False
     # 2. upscale whatever is new or changed (everything else is already valid)
     for proj in projects:
         say(f"Upscaling new or changed textures in {proj.root.name}")
-        proj.upscale(scale=4, tools=tools, backend="torch", log=log)
+        proj.upscale(scale=4, tools=tools, backend=backend, log=log, power=power, torch_model=torch_model)
     # 3. pack into a staging folder next to the mod, then move into place
     say(f"Packing ({PRESETS[preset]['label']})")
     staging = mod_dir.parent.parent / "build" / mod_dir.name
