@@ -19,7 +19,7 @@ import struct
 import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from ..nif import FMT_DXT1, FMT_DXT3, FMT_DXT5, NifError, NifFile, TextureNif
 from ..swap import record_source
@@ -99,7 +99,8 @@ def find_tool(exe: str, tools_dir: str | None) -> str:
 
 
 def _run(cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # No console window per tool call when run from the setup program.
+    proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if proc.returncode != 0:
         raise RuntimeError(f"{Path(cmd[0]).name} failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}")
 
@@ -158,6 +159,14 @@ class Project:
             return json.loads((self.root / "project.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
+
+    @property
+    def max_factor(self) -> int:
+        """Largest factor textures are encoded at ("max_factor" in project.json, default 4).
+        The model still upscales 4x for quality; a 2x project encodes that at 2x."""
+        if not hasattr(self, "_max_factor"):
+            self._max_factor = int(self.config().get("max_factor", 4))
+        return self._max_factor
 
     def load(self) -> list[TexInfo]:
         if not self.manifest_path.exists():
@@ -282,10 +291,17 @@ class Project:
         items[(t.wad, t.name)] = t
 
     def extract(self, wad_paths: Iterable[Path], pattern: str = "*.dds", min_size: int = 64,
-                embedded: bool = False) -> int:
+                embedded: bool = False, max_factor: int | None = None) -> int:
+        """``max_factor`` caps the scale textures are encoded at (kept in project.json);
+        a new project without one gets 2."""
         wad_paths = list(wad_paths)
         cfg = self.config()
         known = cfg.get("wads", [])
+        if max_factor is not None:
+            cfg["max_factor"] = max_factor
+        elif "max_factor" not in cfg and not self.manifest_path.exists():
+            cfg["max_factor"] = 2
+        self._max_factor = int(cfg.get("max_factor", 4))
         cfg.update(pattern=pattern, min_size=min_size, embedded=embedded,
                    wads=["*"] if "*" in known else sorted(set(known) | {Path(w).name for w in wad_paths}))
         self.root.mkdir(parents=True, exist_ok=True)
@@ -315,7 +331,8 @@ class Project:
     def upscale(self, scale: int = 4, model: str = "realesrgan-x4plus-anime", max_size: int = 8192,
                 tools: str | None = None, gpu: str | None = None, backend: str = "torch",
                 torch_model: Path | None = None, log=print,
-                encode_scale: dict[str, int] | None = None) -> int:
+                encode_scale: dict[str, int] | None = None, power: dict | None = None,
+                progress: Callable[[int, int], None] | None = None) -> int:
         """Decode -> upscale -> validate every image -> encode. Raises if any image fails.
 
         ``backend="torch"`` (CUDA PyTorch, default) or ``"ncnn"`` (realesrgan-ncnn-vulkan,
@@ -327,6 +344,9 @@ class Project:
         at (the model still runs at ``scale``; texconv downsamples, which beats
         upscaling straight to the lower factor). It keeps big archives under
         KIWAD's 4 GiB limit, e.g. {"Equipment-WorldData.wad": 2}.
+
+        ``power`` is a hardware.power_settings() dict (tile, batch, memory share,
+        GPU rest). ``progress(done, total)`` reports the AI step in source pixels.
         """
         self.encode_scale = encode_scale or {}
         if scale not in (2, 3, 4):
@@ -414,45 +434,62 @@ class Project:
         # Last resorts are plain Lanczos, then bilinear (no ringing on hard alpha
         # edges): every texture ends up at the target size, AI where faithful.
         alpha_modes = {1: "model", 2: "lanczos", 3: "resample", 4: "bilinear", 5: "nearest"}
+        upscaler = None
+
+        def get_upscaler():
+            nonlocal upscaler
+            if upscaler is None:
+                opts = dict(power or {})
+                if backend == "torch":
+                    from .torch_upscale import DEFAULT_MODEL, TorchUpscaler
+                    upscaler = TorchUpscaler(torch_model or DEFAULT_MODEL, **opts)
+                    if upscaler.scale != scale:
+                        raise ValueError(f"model is x{upscaler.scale}, asked for x{scale}")
+                else:
+                    from .ncnn_upscale import NcnnUpscaler
+                    upscaler = NcnnUpscaler(find_tool("realesrgan-ncnn-vulkan.exe", tools), model, scale, gpu,
+                                            log=log, **opts)
+            return upscaler
+
         for attempt in alpha_modes:
             if not todo:
                 break
             for t in todo:
                 (self.up / self.flat(t, ".png")).unlink(missing_ok=True)
-            if backend == "torch":
-                from .torch_upscale import DEFAULT_MODEL, TorchUpscaler
-                up = TorchUpscaler(torch_model or DEFAULT_MODEL)
-                if up.scale != scale:
-                    raise ValueError(f"model is x{up.scale}, asked for x{scale}")
-                # The same texture is copied into many WADs and models; upscale
-                # each distinct image once and copy the result to its twins.
-                groups: dict[bytes, list[TexInfo]] = {}
-                for t in todo:
-                    digest = hashlib.sha1((self.png / self.flat(t, ".png")).read_bytes()).digest()
-                    groups.setdefault(digest, []).append(t)
-                # Size order puts same-shape images together so they batch on the GPU.
-                reps = sorted((g[0] for g in groups.values()), key=lambda t: (t.height, t.width))
-                if len(reps) < len(todo):
-                    log(f"  {len(todo)} images, {len(reps)} distinct")
-                step = max(len(reps) // 20, 1)
-                # Second pass keeps the AI color but resizes the source alpha
-                # conventionally (the network solidifies faint strokes).
-                up.upscale_files(((self.png / self.flat(t, ".png"), self.up / self.flat(t, ".png")) for t in reps),
-                                 alpha_mode=alpha_modes[attempt],
-                                 progress=lambda i, _p: (i + 1) % step == 0 and log(f"  {i + 1}/{len(reps)}"))
-                for g in groups.values():
-                    src = self.up / self.flat(g[0], ".png")
-                    for t in g[1:]:
-                        dst = self.up / self.flat(t, ".png")
-                        # Names that differ only in case are one file on Windows.
-                        if src.exists() and os.path.normcase(dst) != os.path.normcase(src):
-                            shutil.copyfile(src, dst)
-            else:
-                esrgan = find_tool("realesrgan-ncnn-vulkan.exe", tools)
-                for t in todo:  # one file per process: a lost device can't poison the rest
-                    cmd = [esrgan, "-i", str(self.png / self.flat(t, ".png")), "-o", str(self.up / self.flat(t, ".png")),
-                           "-n", model, "-s", str(scale), "-f", "png"] + (["-g", gpu] if gpu is not None else [])
-                    _run(cmd)
+            up = get_upscaler()
+            # The same texture is copied into many WADs and models; upscale
+            # each distinct image once and copy the result to its twins.
+            groups: dict[bytes, list[TexInfo]] = {}
+            for t in todo:
+                digest = hashlib.sha1((self.png / self.flat(t, ".png")).read_bytes()).digest()
+                groups.setdefault(digest, []).append(t)
+            # Size order puts same-shape images together so they batch on the GPU.
+            reps = sorted((g[0] for g in groups.values()), key=lambda t: (t.height, t.width))
+            if len(reps) < len(todo):
+                log(f"  {len(todo)} images, {len(reps)} distinct")
+            step = max(len(reps) // 20, 1)
+            # Progress is weighted by pixels: images are sorted small to large.
+            cum, total = [], 0
+            for t in reps:
+                total += t.width * t.height
+                cum.append(total)
+
+            def tick(i: int, _p, reps=reps, cum=cum, total=total, attempt=attempt) -> None:
+                if (i + 1) % step == 0:
+                    log(f"  {i + 1}/{len(reps)}")
+                if progress and attempt == 1:
+                    progress(cum[i], total)
+            # Second pass keeps the AI color but resizes the source alpha
+            # conventionally (the network solidifies faint strokes).
+            up.upscale_files(((self.png / self.flat(t, ".png"), self.up / self.flat(t, ".png")) for t in reps),
+                             alpha_mode=alpha_modes[attempt], progress=tick)
+            for g in groups.values():
+                src = self.up / self.flat(g[0], ".png")
+                for t in g[1:]:
+                    dst = self.up / self.flat(t, ".png")
+                    # Names that differ only in case are one file on Windows.
+                    if src.exists() and os.path.normcase(dst) != os.path.normcase(src):
+                        shutil.copyfile(src, dst)
             bad = failures(todo)
             todo = [t for t in todo if key(t) in bad]
             if todo:
@@ -480,12 +517,11 @@ class Project:
         self._encode(texconv, stale, scale, max_size)
         bad = {key(t): r for t, r in zip(stale, _pmap(check, stale)) if r}
         for mode in ("lanczos",):
-            if not bad or backend != "torch":
+            if not bad:
                 break
             log(f"{len(bad)} encoded textures failed; re-doing them with {mode}-resized source alpha")
-            from .torch_upscale import DEFAULT_MODEL, TorchUpscaler
             redo = [t for t in items if key(t) in bad]
-            TorchUpscaler(torch_model or DEFAULT_MODEL).upscale_files(
+            get_upscaler().upscale_files(
                 ((self.png / self.flat(t, ".png"), self.up / self.flat(t, ".png")) for t in redo), alpha_mode=mode)
             self._encode(texconv, redo, scale, max_size)
             bad = {key(t): r for t, r in zip(redo, _pmap(lambda t: self._check_dds(t, self.dds / self.flat(t, ".dds")), redo)) if r}
@@ -505,7 +541,7 @@ class Project:
 
     def _factor(self, t: TexInfo, scale: int, max_size: int) -> int:
         # Cap the long edge by halving, so power-of-two sources stay power-of-two.
-        factor = min(scale, getattr(self, "encode_scale", {}).get(t.wad, scale))
+        factor = min(scale, getattr(self, "encode_scale", {}).get(t.wad, scale), self.max_factor)
         while max(t.width, t.height) * factor > max_size and factor > 1:
             factor //= 2
         return factor
