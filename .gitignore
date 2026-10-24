@@ -7,3 +7,5 @@ mods/
 *.dds
 *.png
 *.pth
+build/
+dist/
