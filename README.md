@@ -87,7 +87,7 @@ Every stage is recorded in `state.json`, and every step underneath resumes from 
 | Card | Backend | Notes |
 |---|---|---|
 | NVIDIA, Turing (GTX 16 / RTX 20) or newer | PyTorch CUDA, fp16, batched | Fastest |
-| AMD, Intel, older NVIDIA | `realesrgan-ncnn-vulkan` (Vulkan) | Same model; on an RTX 5070 Ti it ran at about 80% of CUDA speed |
+| AMD, Intel, older NVIDIA | `realesrgan-ncnn-vulkan` (Vulkan) | Same model; in testing it ran at about 80% of CUDA speed |
 
 `torch-directml` was tried for AMD/Intel as well. It produced correct results, but it ran at half the speed of the Vulkan build and needs an old torch. The Vulkan build is also a 50 MB download instead of several hundred MB, so that's what's used.
 
