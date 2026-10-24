@@ -1,7 +1,9 @@
-"""Build dist/Texmancer-Setup.exe (PyInstaller one-file, windowed).
+"""Build Texmancer-Setup.exe (PyInstaller one-file, windowed).
 
     python -m pip install pyinstaller
-    python installer/build_exe.py
+    python installer/build_exe.py [--out DIR]
+
+The exe lands in DIR/dist and the build files in DIR/build (default: the repo).
 
 The exe holds the setup window plus a copy of the texmancer package, which it
 deploys into the runtime it downloads. After building, every file inside the
@@ -19,8 +21,6 @@ import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BUILD = ROOT / "build"
-DIST = ROOT / "dist"
 NAME = "Texmancer-Setup"
 
 
@@ -40,7 +40,7 @@ def personal_markers() -> list[re.Pattern[bytes]]:
     return [re.compile(p, re.I) for p in pats]
 
 
-def scan(exe: Path) -> list[str]:
+def scan(exe: Path, tmp: Path) -> list[str]:
     """Every member of the exe (and of its PYZ module archive), decompressed."""
     from PyInstaller.archive.readers import CArchiveReader, ZlibArchiveReader
 
@@ -56,7 +56,6 @@ def scan(exe: Path) -> list[str]:
 
     check("exe", exe.read_bytes())
     arch = CArchiveReader(str(exe))
-    tmp = BUILD / "scan"
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
     for name in arch.toc:
@@ -83,8 +82,14 @@ def scan(exe: Path) -> list[str]:
 
 
 def main() -> int:
+    import argparse
+
     import PyInstaller.__main__
 
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", type=Path, default=ROOT, help="folder for build/ and dist/ (default: the repo)")
+    out = ap.parse_args().out.resolve()
+    BUILD, DIST = out / "build", out / "dist"
     pkg = BUILD / "pkg"
     shutil.rmtree(BUILD, ignore_errors=True)
     shutil.copytree(ROOT / "texmancer", pkg / "texmancer", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -99,7 +104,7 @@ def main() -> int:
           for a in ("--exclude-module", m)],
     ])
     exe = DIST / f"{NAME}.exe"
-    hits = scan(exe)
+    hits = scan(exe, BUILD / "scan")
     if hits:
         print("\nPersonal info found in the build:\n  " + "\n  ".join(hits[:20]), file=sys.stderr)
         return 1
