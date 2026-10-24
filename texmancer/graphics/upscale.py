@@ -378,7 +378,15 @@ class Project:
         def failures(ts) -> dict[str, str]:
             def one(t):
                 up = self.up / self.flat(t, ".png")
-                return key(t), check_upscale(self.png / self.flat(t, ".png"), up, scale) if up.exists() else "missing"
+                if up.exists():
+                    return key(t), check_upscale(self.png / self.flat(t, ".png"), up, scale)
+                # The upscaled PNGs may have been deleted to save space: a finished,
+                # valid DDS at the right size means this texture is done.
+                f = self.dds / self.flat(t, ".dds")
+                if (f.exists() and _out_size(f)[0] == t.width * self._factor(t, scale, max_size)
+                        and self._check_dds(t, f) is None):
+                    return key(t), None
+                return key(t), "missing"
             return {k: r for k, r in _pmap(one, ts) if r}
 
         initial = failures(items)
@@ -388,7 +396,8 @@ class Project:
             # stops before twins are copied); reuse that instead of re-running it.
             def digest(t: TexInfo) -> bytes:
                 return hashlib.sha1((self.png / self.flat(t, ".png")).read_bytes()).digest()
-            done = {d: t for t, d in zip(items, _pmap(digest, items)) if key(t) not in initial}
+            done = {d: t for t, d in zip(items, _pmap(digest, items))
+                    if key(t) not in initial and (self.up / self.flat(t, ".png")).exists()}
             reused = 0
             for t, d in zip(todo, _pmap(digest, todo)):
                 src = done.get(d)

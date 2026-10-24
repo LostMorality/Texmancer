@@ -74,6 +74,8 @@ python -m texmancer build --mod mods/HD
 
 Only the parts of the game that changed get upscaled again, so this is much faster than the first build.
 
+To free disk space after a build, you can delete the `up` folder inside your work folder (the full-size upscaled PNGs, usually the biggest part). The finished textures in `dds` are kept, and rebuilds still only redo what changed.
+
 ## Optional: room for even more 4x textures (off by default)
 
 The game won't read any archive file bigger than 2 GB. Texmancer gets around that by splitting large parts of the game across two files. A few very large parts (monsters, shared world art, gear) are still too big even then, so some of their textures get packed at 2x.
