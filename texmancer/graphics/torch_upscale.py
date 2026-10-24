@@ -6,6 +6,7 @@ inputs so VRAM stays bounded.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -13,26 +14,25 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .imageops import keep_binary_alpha, resize
+
 DEFAULT_MODEL = Path.home() / "models" / "RealESRGAN_x4plus_anime_6B.pth"
 
 
-def _keep_binary_alpha(src: np.ndarray, out: Image.Image) -> Image.Image:
-    """1-bit alpha (DXT1 cut-outs) stays 1-bit: soft upscaled edges would be
-    thresholded by the encoder anyway, and on small icons they shift the shape."""
-    a = src[..., 3]
-    if a.min() == 255 or not np.isin(a, (0, 255)).all():
-        return out
-    arr = np.array(out)
-    arr[..., 3] = np.where(arr[..., 3] >= 128, 255, 0).astype(np.uint8)
-    return Image.fromarray(arr, "RGBA")
-
-
 class TorchUpscaler:
-    def __init__(self, model_path: Path = DEFAULT_MODEL, tile: int = 384, pad: int = 16):
+    def __init__(self, model_path: Path = DEFAULT_MODEL, tile: int = 384, pad: int = 16, batch: int = 2,
+                 mem: float | None = None, rest: float = 0.0, workers: int = 8, **_ignored):
+        """``batch``: small images per pass, in full tiles' worth of pixels.
+        ``mem``: share of the card's memory this process may take.
+        ``rest``: seconds the GPU idles per second of work, so a game running
+        at the same time keeps its frame rate (Low power)."""
         import spandrel
 
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available; install torch from the cu130 index")
+            raise RuntimeError("CUDA is not available; install torch from the cu128 index")
+        if mem:
+            torch.cuda.set_per_process_memory_fraction(mem)
+        self.batch, self.rest, self.workers = batch, rest, workers
         desc = spandrel.ModelLoader().load_from_file(str(model_path))
         self.scale = desc.scale
         self.half = desc.supports_half
@@ -82,25 +82,31 @@ class TorchUpscaler:
             if h * w <= self.tile * self.tile:
                 groups.setdefault((h, w), []).append(i)
             else:
-                out[i] = self._run(a)
-        # Pixel budget per batch: two full tiles' worth keeps VRAM where single tiles were.
-        budget = 2 * self.tile * self.tile
+                out[i] = self._paced(self._run, a)
+        # Pixel budget per batch, in full tiles' worth (2 keeps VRAM where single tiles were).
+        budget = self.batch * self.tile * self.tile
         for (h, w), idx in groups.items():
             n = max(1, budget // (h * w))
             for k in range(0, len(idx), n):
                 part = idx[k:k + n]
-                for i, y in zip(part, self._run_batch([arrs[i] for i in part])):
+                for i, y in zip(part, self._paced(self._run_batch, [arrs[i] for i in part])):
                     out[i] = y
         return out  # type: ignore[return-value]
 
+    def _paced(self, fn, arg):
+        if not self.rest:
+            return fn(arg)
+        t = time.perf_counter()
+        res = fn(arg)  # returns host arrays, so the GPU work is finished here
+        time.sleep((time.perf_counter() - t) * self.rest)
+        return res
+
     def _upscale_arrays(self, rgbas: list[np.ndarray], alpha_mode: str) -> list[Image.Image]:
-        return [_keep_binary_alpha(src, out) for src, out in zip(rgbas, self._upscale_raw(rgbas, alpha_mode))]
+        return [keep_binary_alpha(src, out) for src, out in zip(rgbas, self._upscale_raw(rgbas, alpha_mode))]
 
     def _upscale_raw(self, rgbas: list[np.ndarray], alpha_mode: str) -> list[Image.Image]:
         if alpha_mode in ("resample", "bilinear", "nearest"):  # last resorts: conventional resizes, no model
-            filt = {"resample": Image.LANCZOS, "bilinear": Image.BILINEAR, "nearest": Image.NEAREST}[alpha_mode]
-            return [Image.fromarray(a, "RGBA").resize((a.shape[1] * self.scale, a.shape[0] * self.scale), filt)
-                    for a in rgbas]
+            return [resize(a, self.scale, alpha_mode) for a in rgbas]
         jobs: list[np.ndarray] = []
         for rgba in rgbas:
             jobs.append(np.ascontiguousarray(rgba[..., :3]))
@@ -129,7 +135,7 @@ class TorchUpscaler:
 
     def upscale_files(self, pairs: Iterable[tuple[Path, Path]], alpha_mode: str = "model",
                       progress: Callable[[int, Path], None] | None = None,
-                      chunk: int = 64, workers: int = 8) -> None:
+                      chunk: int = 64, workers: int | None = None) -> None:
         """Decode the next chunk and encode finished PNGs on threads while the GPU
         works, so it never waits on file I/O. Pass pairs sorted by size so
         same-shape images land in one chunk and batch together."""
@@ -144,7 +150,7 @@ class TorchUpscaler:
         def save(img: Image.Image, dst: Path) -> None:
             img.save(dst, compress_level=1)
 
-        with ThreadPoolExecutor(workers) as io:
+        with ThreadPoolExecutor(workers or self.workers) as io:
             chunks = [pairs[i:i + chunk] for i in range(0, len(pairs), chunk)]
             pending = [io.submit(load, s) for s, _ in chunks[0]] if chunks else []
             saves: list = []
