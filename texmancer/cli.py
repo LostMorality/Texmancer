@@ -21,14 +21,29 @@ def _wads(a: argparse.Namespace) -> list[Path]:
 def cmd_extract(a: argparse.Namespace) -> int:
     from .graphics import Project
     p = Project(a.work)
-    n = p.extract(_wads(a), pattern=a.pattern, min_size=a.min_size, embedded=a.embedded)
+    n = p.extract(_wads(a), pattern=a.pattern, min_size=a.min_size, embedded=a.embedded, max_factor=a.max_factor)
     print(f"{n} textures in {a.work}")
     return 0
 
 
+def _engine(a: argparse.Namespace) -> tuple[str, dict]:
+    """Backend and power settings: the given ones, else picked for the best graphics card."""
+    from . import hardware
+    gpus = hardware.detect()
+    gpu = gpus[0] if gpus else None
+    backend = a.backend or (gpu.backend if gpu else "torch")
+    power = hardware.power_settings(a.power, gpu)
+    if power.get("priority") == "below_normal":
+        hardware.set_low_priority()
+    print(f"{gpu.describe() if gpu else 'no graphics card found'}; backend {backend}, power {a.power}")
+    return backend, power
+
+
 def cmd_upscale(a: argparse.Namespace) -> int:
     from .graphics import Project
-    n = Project(a.work).upscale(scale=a.scale, tools=a.tools, max_size=a.max_size)
+    backend, power = _engine(a)
+    n = Project(a.work).upscale(scale=a.scale, tools=a.tools, max_size=a.max_size, backend=backend, power=power,
+                                torch_model=Path(a.model) if a.model else None)
     print(f"upscaled {n} textures")
     return 0
 
@@ -48,13 +63,16 @@ def cmd_pack(a: argparse.Namespace) -> int:
 
 def cmd_build(a: argparse.Namespace) -> int:
     from .graphics.build import build_mod
-    build_mod(Path(a.mod), preset=a.preset, everything=a.all, tools=a.tools, game_data=Path(a.game_data))
+    backend, power = _engine(a)
+    build_mod(Path(a.mod), preset=a.preset, everything=a.all, tools=a.tools, game_data=Path(a.game_data),
+              backend=backend, power=power, torch_model=Path(a.model) if a.model else None)
     return 0
 
 
 def _swapper(a: argparse.Namespace, **kw):
     from .swap import Swapper
-    return Swapper(Path(a.mods), Path(a.game_data), **kw)
+    game_data = Path(a.game_data)
+    return Swapper(Path(a.mods), game_data, install=game_data.parent.parent, **kw)
 
 
 def cmd_play(a: argparse.Namespace) -> int:
@@ -94,6 +112,14 @@ def cmd_wad(a: argparse.Namespace) -> int:
     return 0
 
 
+def _engine_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--backend", choices=["torch", "ncnn"],
+                   help="torch = CUDA (NVIDIA), ncnn = Vulkan (any card); default: picked for your card")
+    p.add_argument("--power", default="balanced", choices=["low", "balanced", "max"],
+                   help="low leaves the game playable while it works")
+    p.add_argument("--model", help="path to RealESRGAN_x4plus_anime_6B.pth (torch backend)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="texmancer", description="AI-upscaled textures for Wizard101.")
     p.add_argument("--game-data", default=str(GAME_DATA), help="Wizard101's Data\\GameData folder")
@@ -106,19 +132,23 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--pattern", default="*", help="entry name filter, e.g. *.dds or *.nif")
     e.add_argument("--min-size", type=int, default=1, help="skip textures whose long edge is smaller")
     e.add_argument("--embedded", action="store_true", help="also textures stored inside model files")
+    e.add_argument("--max-factor", type=int, choices=[2, 4],
+                   help="largest scale to encode at (new work folders default to 2; 4 is for 4K screens)")
     e.set_defaults(fn=cmd_extract)
 
     u = sub.add_parser("upscale", help="AI-upscale, validate and encode a work folder")
     u.add_argument("--work", required=True)
     u.add_argument("--scale", type=int, default=4, choices=[2, 3, 4])
     u.add_argument("--max-size", type=int, default=8192, help="largest output edge in pixels")
-    u.add_argument("--tools", help="folder containing texconv.exe")
+    u.add_argument("--tools", help="folder containing texconv.exe (and realesrgan-ncnn-vulkan.exe)")
+    _engine_args(u)
     u.set_defaults(fn=cmd_upscale)
 
     k = sub.add_parser("pack", help="pack one or more work folders into a mod folder of archives")
     k.add_argument("--work", action="append", required=True, help="work folder (repeatable)")
     k.add_argument("--out", required=True, help="mod folder to write")
-    k.add_argument("--preset", default="full", choices=["full", "balanced", "light"])
+    k.add_argument("--preset", default="balanced", choices=["full", "balanced", "light"],
+                   help="balanced = 2x (default), full = 4x (only worth it on 4K screens), light = 2x small art only")
     k.add_argument("--no-overlays", action="store_true", help="don't spill into Locale_* overlay archives")
     k.add_argument("--extended", action="store_true",
                    help="pack archives up to 4 GiB; needs `play --extended-archives` (see README)")
@@ -131,6 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--preset", choices=["full", "balanced", "light"])
     b.add_argument("--all", action="store_true", help="rebuild every archive")
     b.add_argument("--tools")
+    _engine_args(b)
     b.set_defaults(fn=cmd_build)
 
     for name, fn, text in (("play", cmd_play, "swap mods in after the launcher patches; restore on exit"),
