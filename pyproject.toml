@@ -1,6 +1,6 @@
 [project]
 name = "texmancer"
-version = "1.0.0"
+version = "1.1.0"
 description = "AI-upscaled textures for Wizard101, built on your own PC"
 readme = "README.md"
 license = {text = "MIT"}
