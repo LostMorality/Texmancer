@@ -173,7 +173,7 @@ class App:
         f = ttk.Frame(grid)
         f.grid(row=4, column=1, sticky="w", pady=4)
         self.mode_widgets = [
-            ttk.Radiobutton(f, text="Everything: the menus and Wizard City first (ready in minutes), then the rest",
+            ttk.Radiobutton(f, text="Everything: the menus and Wizard City first (playable sooner), then the rest",
                             value="all", variable=self.mode, command=self._refresh),
             ttk.Radiobutton(f, text="Quick only: just the menus and Wizard City", value="quick",
                             variable=self.mode, command=self._refresh)]
