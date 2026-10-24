@@ -158,3 +158,30 @@ def test_patched_client_is_restored_with_the_archives(layout, tmp_path):
     s.swap_in()
     s.restore()
     assert exe.read_bytes() == _fake_client() and not s.client_patched
+
+
+def test_overlay_cache_vouches_for_live_base(tmp_path):
+    from texmancer.swap import overlay_cache
+    base = tmp_path / "Equipment-WorldData.wad"
+    base.write_bytes(b"x" * 1234)
+    cache = bytes(range(24))
+    out = overlay_cache(cache, base)
+    assert out[:4] == cache[:4] and out[8:16] == cache[8:16]
+    assert int.from_bytes(out[4:8], "little") == 1234
+    assert int.from_bytes(out[16:], "little") == base.stat().st_mtime_ns // 1_000_000
+    assert overlay_cache(b"short", base) is None
+
+
+def test_restore_drops_an_archive_the_game_replaced(tmp_path):
+    game, mods = tmp_path / "GameData", tmp_path / "Mods"
+    game.mkdir(); (mods / "HD").mkdir(parents=True)
+    (game / "Root.wad").write_bytes(b"original")
+    (mods / "HD" / "Root.wad").write_bytes(b"modded archive, much bigger")
+    s = Swapper(mods, game, log=lambda m: None, game_running=lambda: False)
+    s.install = tmp_path
+    s.swap_in()
+    (game / "Root.wad").write_bytes(b"redownload")  # the client overwrote it mid-session
+    s.restore()
+    assert (game / "Root.wad").read_bytes() == b"original"
+    assert not (mods / "HD" / "Root.wad").exists()
+    assert s.replaced == ["HD/Root.wad"]

@@ -36,13 +36,20 @@ def write_meta(mod_dir: Path, meta: dict) -> None:
 
 
 def stale_wads(mod_dir: Path, game_data: Path = GAME_DATA) -> list[str]:
-    """Mod archives whose game original changed since the mod was built."""
-    out = []
+    """Mod archives whose game original changed since the mod was built, plus
+    any listed in the mod's textures.json that are missing (e.g. the game
+    re-downloaded one over the mod during play)."""
+    out = set()
     for w in sorted(mod_dir.glob("*.wad")):
         live = game_data / w.name
         if live.exists() and source_matches(w, live) is False:
-            out.append(w.name)
-    return out
+            out.add(w.name)
+    try:
+        packed = json.loads((mod_dir / "textures.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        packed = {}
+    out.update(n for n in packed if not (mod_dir / n).exists() and (game_data / n).exists())
+    return sorted(out)
 
 
 def build_mod(mod_dir: Path, preset: str | None = None, everything: bool = False, tools: str | None = None,

@@ -47,6 +47,25 @@ _NOP6 = b"\x66\x0f\x1f\x44\x00\x00"
 EXTENDED_LIMIT = 0xFFFFFFFF - 1
 
 
+def overlay_cache(base_cache: bytes, base: Path) -> bytes | None:
+    """A ``CRC_Locale_<locale>-<pkg>.dat`` that vouches for ``base`` as it is now.
+
+    When the game first asks for a package that has a locale overlay, it
+    "patches" the overlay package, and that patch checks the *base* archive:
+    if its size or mtime doesn't match the cache, the client re-downloads the
+    whole base over the modded one. The cache is 24 bytes: CRC, u32 size,
+    CRC, padding, u64 mtime in ms. Keep the base package's CRCs (they match
+    the server) and stamp the live file's size and mtime.
+    """
+    if len(base_cache) != 24:
+        return None
+    st = base.stat()
+    if st.st_size > 0xFFFFFFFF:
+        return None
+    return (base_cache[:4] + st.st_size.to_bytes(4, "little") + base_cache[8:16]
+            + (st.st_mtime_ns // 1_000_000).to_bytes(8, "little"))
+
+
 def patch_client_bytes(exe: bytes) -> bytes | None:
     """The client with its 2 GiB archive checks lifted, or None if this build doesn't
     look exactly like the one the patch was made for."""
@@ -214,6 +233,7 @@ class Swapper:
     # Runs right after each launcher patch pass, before PLAY: config tweaks the
     # patcher would otherwise revert (it rewrites Bin files) are re-applied here.
     after_patch: Callable[[], None] = lambda: None
+    replaced: list[str] = field(default_factory=list)  # mod archives the game overwrote last session
     # Lift the client's 2 GiB-per-archive limit for this session (needed by mods
     # with archives past 2 GiB); the original exe comes back with the archives.
     patch_client: bool = False
@@ -236,8 +256,26 @@ class Swapper:
     def all_mods(self) -> list[Path]:
         if not self.mods_dir.is_dir():
             return []
+        # While swapped in, a mod's archives live in the game folder, so its own
+        # folder can be empty; the swap state still names it.
+        live = {e.removeprefix("+").split("/", 1)[0] for e in self.swapped_entries()}
         return sorted(d for d in self.mods_dir.iterdir()
-                      if d.is_dir() and d.resolve() != self.backup_dir.resolve() and any(d.glob("*.wad")))
+                      if d.is_dir() and d.resolve() != self.backup_dir.resolve()
+                      and (d.name in live or any(d.glob("*.wad"))))
+
+    def swapped_entries(self) -> list[str]:
+        """``Mod/Archive.wad`` paths currently swapped into the game ("+" = added)."""
+        try:
+            return list(json.loads(self.state_path.read_text(encoding="utf-8"))["swapped"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return []
+
+    def installed_wads(self, mod: Path) -> list[Path]:
+        """Every archive of ``mod``, wherever it is right now: in its folder, or
+        in the game folder while swapped in."""
+        live = [self.game_data / e.removeprefix("+").split("/", 1)[1] for e in self.swapped_entries()
+                if e.removeprefix("+").split("/", 1)[0] == mod.name]
+        return sorted(self.wads(mod) + [w for w in live if w.is_file()], key=lambda w: w.name.lower())
 
     def mods(self) -> list[Path]:
         return [d for d in self.all_mods() if self.only is None or d.name in self.only]
@@ -329,7 +367,26 @@ class Swapper:
         except Exception:
             self._restore(done)
             raise
+        if done:
+            self._write_state(done, sizes={e: (self.game_data / Path(e).name).stat().st_size for e in done})
+            self._seed_overlay_caches()
         self.log(f"swapped in: {', '.join(done)}" if done else "no usable mods; playing unmodded")
+
+    def _seed_overlay_caches(self) -> None:
+        info = self.install / "PatchInfo"
+        for ovl in self.game_data.glob("Locale_*-*.wad"):
+            locale_pkg = ovl.stem  # Locale_en-US-Equipment-WorldData
+            if locale_pkg.lower().endswith("-root"):
+                continue
+            pkg = locale_pkg.split("-", 2)[2] if locale_pkg.count("-") >= 2 else ""
+            base, base_cache = self.game_data / f"{pkg}.wad", info / f"CRC_{pkg}.dat"
+            if not (pkg and base.is_file() and base_cache.is_file()):
+                continue
+            data = overlay_cache(base_cache.read_bytes(), base)
+            if data is None:
+                self.log(f"can't vouch for {base.name} (unknown cache layout); the game may re-download it")
+                continue
+            (info / f"CRC_{locale_pkg}.dat").write_bytes(data)
 
     @property
     def client_exe(self) -> Path:
@@ -370,15 +427,17 @@ class Swapper:
             self._unpatch_client()
             self.log("nothing swapped in")
             return
-        entries = json.loads(self.state_path.read_text())["swapped"]
-        self._restore(entries)
+        state = json.loads(self.state_path.read_text())
+        entries = state["swapped"]
+        self._restore(entries, state.get("sizes", {}))
         self._unpatch_client()
         # The client "patches" every overlay package it registers and leaves CRC caches.
         for f in (self.install / "PatchInfo").glob("CRC_Locale_*.dat"):
             f.unlink(missing_ok=True)
         self.log(f"restored originals: {', '.join(Path(e).name for e in entries)}")
 
-    def _restore(self, entries: list[str]) -> None:
+    def _restore(self, entries: list[str], sizes: dict[str, int] | None = None) -> None:
+        sizes = sizes or {}
         # Entries are "Mod/Name.wad"; a bare "Name.wad" is the old flat layout.
         for rel in reversed(entries):
             if rel.startswith("+"):  # an added archive goes home; there's no original
@@ -394,12 +453,23 @@ class Swapper:
             if not orig.exists():
                 raise FileNotFoundError(f"backup {orig} missing; repair with the launcher (it re-downloads)")
             home.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(live, home)
+            want = sizes.get(rel)
+            if want is not None and live.exists() and live.stat().st_size != want:
+                # The game replaced our archive mid-session (a re-download). That
+                # copy is just the stock file, so it must not become the mod.
+                live.unlink()
+                self.replaced.append(rel)
+                self.log(f"the game re-downloaded {name} during play; that mod archive needs a rebuild")
+            else:
+                os.replace(live, home)
             os.replace(orig, live)
         self.state_path.unlink(missing_ok=True)
 
-    def _write_state(self, entries: list[str]) -> None:
-        self.state_path.write_text(json.dumps({"swapped": entries, "time": time.time()}))
+    def _write_state(self, entries: list[str], sizes: dict[str, int] | None = None) -> None:
+        state = {"swapped": entries, "time": time.time()}
+        if sizes:
+            state["sizes"] = sizes
+        self.state_path.write_text(json.dumps(state))
 
     # -- watcher ------------------------------------------------------------
 
