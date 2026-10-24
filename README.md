@@ -6,14 +6,24 @@
 
 1. **Download** `Texmancer-Setup.exe` from the [Releases page](https://github.com/LostMorality/Texmancer/releases/latest).
 2. **Run it.** It finds Wizard101 on its own. If it can't, click **Change…** and pick your Wizard101 folder.
-3. **Click Start.** The menus and Wizard City are ready in a few minutes. The rest of the game keeps going in the background, and the window shows how long is left. You can close it any time. Next time you open it, it carries on where it stopped.
+3. **Click Start.** The menus and Wizard City are done first, usually within an hour on a recent graphics card. The rest of the game keeps going in the background, and the window shows how long is left. You can close it any time. Next time you open it, it carries on where it stopped.
 4. **Click "Play with HD textures"**, then open Wizard101 and log in like you always do. Keep the Texmancer window open while you play. When you close the game, your original files go back.
 
 That's it. Nothing to install by hand.
 
-> **Use at your own risk.** Changing game files is against KingsIsle's Terms of Service. Texmancer only changes how textures look on your screen, but your account is your responsibility.
->
-> **No game files are shared.** Texmancer doesn't include or download any of Wizard101's art. Everything is made from the copy of the game already on your computer, so nobody else's files are involved.
+## Is this safe / allowed?
+
+**It's against KingsIsle's rules.** Their Terms of Use don't allow modifying the game or making derivative works of it, and that includes the images in it. Texmancer does both, on your own PC. Use it at your own risk: your account is your responsibility.
+
+Here is exactly what it does and doesn't do, so you can decide for yourself:
+
+- **It only changes how textures look on your own screen.** Other players see nothing different.
+- **It doesn't touch gameplay, the network, KingsIsle's servers, other players or your account.** There's no automation and no advantage of any kind. Everything plays exactly the same.
+- **It ships no game files.** Texmancer doesn't include or download any of Wizard101's art, upscaled or not. Everything is made on your PC from the copy of the game you already have.
+- **The game is never left modified.** The HD files are swapped in only while you play, and your original files go back as soon as you close the game. If anything goes wrong, **Put original files back** restores them.
+- **One optional extra changes the game's exe** ([4 GB archives](#optional-4-gb-archives-off-by-default)). It's off by default and only matters for 4x builds. While you play, it swaps in a copy of the game's exe with three file-size checks switched off, and puts the original back when the game closes. The setup window never turns it on.
+
+Texmancer isn't affiliated with or endorsed by KingsIsle Entertainment.
 
 ### What you need
 
@@ -173,7 +183,7 @@ pip install pyinstaller
 python installer/build_exe.py
 ```
 
-The result is `dist/Texmancer-Setup.exe`. The build script unpacks every file inside the exe and fails if it finds the building PC's user name, home folder or computer name.
+The result is `dist/Texmancer-Setup.exe`; `--out DIR` puts `build/` and `dist/` somewhere else. The build script unpacks every file inside the exe and fails if it finds the building PC's user name, home folder or computer name.
 
 ## Credits
 
